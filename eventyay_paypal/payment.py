@@ -318,14 +318,19 @@ class Paypal(BasePaymentProvider):
         )
 
     def payment_prepare(self, request, payment_obj):
+        # Paying an existing order (retry / after approval) must remember the
+        # OrderPayment so the PayPal return view can capture it. Without this,
+        # success() treats the return as cart checkout and redirects to an empty
+        # cart ("Your cart is empty") without recording the payment.
         return self.start_paypal_order(
             request,
             payment_obj.amount,
             return_url=build_absolute_uri(request.event, "plugins:eventyay_paypal:return"),
             cancel_url=build_absolute_uri(request.event, "plugins:eventyay_paypal:abort"),
+            payment=payment_obj,
         )
 
-    def start_paypal_order(self, request, amount, *, return_url: str, cancel_url: str):
+    def start_paypal_order(self, request, amount, *, return_url: str, cancel_url: str, payment=None):
         order_response = self.paypal_request_handler.create_order(
             order_data=self._order_payload(request, amount, return_url=return_url, cancel_url=cancel_url)
         )
@@ -335,7 +340,7 @@ class Paypal(BasePaymentProvider):
                 _("An error occurred during connecting with PayPal: {}").format(errors.get("reason", errors)),
             )
             return None
-        request.session["payment_paypal_payment"] = None
+        request.session["payment_paypal_payment"] = payment.pk if payment is not None else None
         return self._create_order(request, order_response.get("response"))
 
     def _order_payload(self, request, amount, *, return_url: str, cancel_url: str) -> dict:
