@@ -25,6 +25,7 @@ from eventyay.multidomain.urlreverse import build_absolute_uri
 from i18nfield.strings import LazyI18nString
 
 from .models import ReferencedPayPalObject
+from .operational_log import OUTCOME_FAILURE, OUTCOME_SUCCESS, log_operation
 from .paypal_rest import PaypalRequestHandler
 from .utils import (
     COMPLETED_CAPTURE_STATUSES,
@@ -43,6 +44,18 @@ from .utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _log_paypal(outcome, error_code=None, event_id=None, order_id=None, action="payment.charge"):
+    log_operation(
+        action,
+        outcome,
+        backend="paypal",
+        payment_provider="paypal",
+        error_code=error_code,
+        event_id=event_id,
+        order_id=order_id,
+    )
 
 SUPPORTED_CURRENCIES = [
     "AUD",
@@ -430,6 +443,7 @@ class Paypal(BasePaymentProvider):
         if not order or order.get("status") not in ("CREATED", "PAYER_ACTION_REQUIRED"):
             messages.error(request, _("We had trouble communicating with PayPal"))
             logger.error("Invalid order state: %s", order)
+            _log_paypal(OUTCOME_FAILURE, "invalid_order_state", event_id=getattr(request.event, "pk", None))
             return
 
         request.session["payment_paypal_order_id"] = order["id"]
@@ -445,6 +459,7 @@ class Paypal(BasePaymentProvider):
             return str(href)
         messages.error(request, _("We had trouble communicating with PayPal"))
         logger.error("PayPal order %s did not include an approval URL: %s", order.get("id"), order)
+        _log_paypal(OUTCOME_FAILURE, "missing_approval_url", event_id=getattr(request.event, "pk", None))
         return None
 
     def checkout_confirm_render(self, request) -> str:
@@ -459,7 +474,14 @@ class Paypal(BasePaymentProvider):
     def execute_payment(self, request: HttpRequest, payment: OrderPayment):
         def handle_paypal_error(errors, order_id, payment, message):
             exception = errors.get("exception")
+            error_type = errors.get("type")
             logger.error(message, order_id, errors.get("reason", errors))
+            _log_paypal(
+                OUTCOME_FAILURE,
+                error_type if isinstance(error_type, str) else "paypal_error",
+                event_id=self.event.pk,
+                order_id=payment.order_id,
+            )
             payment.fail(
                 info={
                     "error": {
@@ -474,6 +496,7 @@ class Paypal(BasePaymentProvider):
 
         order_id = request.session.get("payment_paypal_order_id", "")
         if not order_id:
+            _log_paypal(OUTCOME_FAILURE, "missing_order", event_id=self.event.pk, order_id=payment.order_id)
             raise PaymentException(
                 _("We were unable to process your payment. See below for details on how to proceed.")
             )
@@ -513,6 +536,7 @@ class Paypal(BasePaymentProvider):
                 payment.id,
                 str(order_detail),
             )
+            _log_paypal(OUTCOME_FAILURE, "amount_mismatch", event_id=self.event.pk, order_id=payment.order_id)
             payment.fail(
                 info={
                     "error": {
@@ -587,6 +611,7 @@ class Paypal(BasePaymentProvider):
         else:
             payment.fail(info=order_detail)
             logger.error("Invalid PayPal order state: %s", order_detail)
+            _log_paypal(OUTCOME_FAILURE, "invalid_order_state", event_id=self.event.pk, order_id=payment.order_id)
             raise PaymentException(
                 _("We were unable to process your payment. See below for details on how to proceed.")
             )
@@ -595,12 +620,14 @@ class Paypal(BasePaymentProvider):
         if not captured_order or captured_order.get("status") != "COMPLETED":
             payment.fail(info=captured_order)
             logger.error("Invalid state: %s", repr(captured_order))
+            _log_paypal(OUTCOME_FAILURE, "invalid_capture_state", event_id=self.event.pk, order_id=payment.order_id)
             raise PaymentException(
                 _("We were unable to process your payment. See below for details on how to proceed.")
             )
 
         if payment.state == OrderPayment.PAYMENT_STATE_CONFIRMED:
             logger.warning("PayPal success event even though order is already marked as paid")
+            _log_paypal(OUTCOME_SUCCESS, "already_confirmed", event_id=self.event.pk, order_id=payment.order_id)
             return
 
         try:
@@ -611,6 +638,7 @@ class Paypal(BasePaymentProvider):
             raise PaymentException(str(e)) from e
         except SendMailException:
             messages.warning(request, _("There was an error sending the confirmation mail."))
+        _log_paypal(OUTCOME_SUCCESS, event_id=self.event.pk, order_id=payment.order_id)
         return None
 
     def payment_pending_render(self, request, payment) -> str:
@@ -702,6 +730,13 @@ class Paypal(BasePaymentProvider):
         )
         if errors := refund_payment.get("errors"):
             logger.error("execute_refund: %s", errors.get("reason", errors))
+            _log_paypal(
+                OUTCOME_FAILURE,
+                "refund_failed",
+                event_id=refund.order.event_id,
+                order_id=refund.order_id,
+                action="payment.refund",
+            )
             refund.order.log_action(
                 "eventyay.event.order.refund.failed",
                 {
@@ -715,7 +750,20 @@ class Paypal(BasePaymentProvider):
         refund_payment_response = refund_payment.get("response") or {}
         refund_id = refund_payment_response.get("id")
         if not refund_id:
+            _log_paypal(
+                OUTCOME_FAILURE,
+                "missing_refund",
+                event_id=refund.order.event_id,
+                order_id=refund.order_id,
+                action="payment.refund",
+            )
             raise PaymentException(_("An error occurred while communicating with PayPal, please try again."))
+        _log_paypal(
+            OUTCOME_SUCCESS,
+            event_id=refund.order.event_id,
+            order_id=refund.order_id,
+            action="payment.refund",
+        )
         refund.info = json.dumps(refund_payment_response)
         refund.save(update_fields=["info"])
 
