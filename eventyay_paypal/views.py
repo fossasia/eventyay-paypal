@@ -22,6 +22,7 @@ from eventyay.control.permissions import event_permission_required
 from eventyay.multidomain.urlreverse import eventreverse
 
 from .models import ReferencedPayPalObject
+from .operational_log import OUTCOME_FAILURE, OUTCOME_SUCCESS, log_operation
 from .payment import Paypal
 from .utils import paypal_merchant_can_receive_payments, safe_get
 
@@ -485,26 +486,76 @@ def webhook(request, *args, **kwargs):
     try:
         event_json = json.loads(event_body)
     except json.JSONDecodeError:
+        log_operation(
+            "webhook.inbound",
+            OUTCOME_FAILURE,
+            backend="paypal",
+            payment_provider="paypal",
+            error_code="invalid_payload",
+            status=400,
+        )
         return HttpResponse("Invalid JSON", status=HTTPStatus.BAD_REQUEST)
 
     if not isinstance(event_json, dict) or not isinstance(event_json.get("resource"), dict):
+        log_operation(
+            "webhook.inbound",
+            OUTCOME_FAILURE,
+            backend="paypal",
+            payment_provider="paypal",
+            error_code="invalid_payload",
+            status=400,
+        )
         return HttpResponse("Invalid webhook payload", status=HTTPStatus.BAD_REQUEST)
 
     if event_json.get("resource_type") not in ("checkout-order", "refund", "capture"):
+        log_operation(
+            "webhook.inbound",
+            OUTCOME_FAILURE,
+            backend="paypal",
+            payment_provider="paypal",
+            error_code="unsupported_event",
+            status=400,
+        )
         return HttpResponse("Wrong resource type", status=HTTPStatus.BAD_REQUEST)
 
     event, payment_id, rpo = parse_webhook_event(request, event_json)
     if event is None:
+        log_operation(
+            "webhook.inbound",
+            OUTCOME_FAILURE,
+            backend="paypal",
+            payment_provider="paypal",
+            error_code="unknown_event",
+            status=400,
+        )
         return HttpResponse("Unable to get event from webhook", status=HTTPStatus.BAD_REQUEST)
 
     prov = Paypal(event)
 
     # Verify signature
     if not check_webhook_signature(request, event, event_json, prov):
+        log_operation(
+            "webhook.inbound",
+            OUTCOME_FAILURE,
+            backend="paypal",
+            payment_provider="paypal",
+            error_code="signature_invalid",
+            status=400,
+            event_id=event.pk,
+        )
         return HttpResponse("Unable to verify signature of webhook", status=HTTPStatus.BAD_REQUEST)
 
     order_detail, payment = extract_order_and_payment(payment_id, event, event_json, prov, rpo)
     if order_detail is None or payment is None:
+        log_operation(
+            "webhook.inbound",
+            OUTCOME_FAILURE,
+            backend="paypal",
+            payment_provider="paypal",
+            error_code="unknown_payment",
+            status=400,
+            event_id=event.pk,
+        )
         return HttpResponse("Order or payment not found", status=HTTPStatus.BAD_REQUEST)
 
     payment.order.log_action("eventyay.plugins.eventyay_paypal.event", data=event_json)
@@ -603,20 +654,41 @@ def webhook(request, *args, **kwargs):
                     payment.save(update_fields=["info"])
                     payment.confirm()
 
-    if payment.state == OrderPayment.PAYMENT_STATE_CONFIRMED and order_detail["status"] in (
-        "PARTIALLY_REFUNDED",
-        "REFUNDED",
-        "COMPLETED",
-    ):
-        handle_payment_state_confirmed()
-    elif payment.state in (
-        OrderPayment.PAYMENT_STATE_PENDING,
-        OrderPayment.PAYMENT_STATE_CREATED,
-        OrderPayment.PAYMENT_STATE_CANCELED,
-        OrderPayment.PAYMENT_STATE_FAILED,
-    ):
-        handle_payment_state_pending()
-
+    try:
+        if payment.state == OrderPayment.PAYMENT_STATE_CONFIRMED and order_detail["status"] in (
+            "PARTIALLY_REFUNDED",
+            "REFUNDED",
+            "COMPLETED",
+        ):
+            handle_payment_state_confirmed()
+        elif payment.state in (
+            OrderPayment.PAYMENT_STATE_PENDING,
+            OrderPayment.PAYMENT_STATE_CREATED,
+            OrderPayment.PAYMENT_STATE_CANCELED,
+            OrderPayment.PAYMENT_STATE_FAILED,
+        ):
+            handle_payment_state_pending()
+    except Exception:
+        log_operation(
+            "webhook.inbound",
+            OUTCOME_FAILURE,
+            backend="paypal",
+            payment_provider="paypal",
+            error_code="processing_error",
+            status=500,
+            event_id=event.pk,
+            order_id=payment.order_id,
+        )
+        raise
+    log_operation(
+        "webhook.inbound",
+        OUTCOME_SUCCESS,
+        backend="paypal",
+        payment_provider="paypal",
+        status=200,
+        event_id=event.pk,
+        order_id=payment.order_id,
+    )
     return HttpResponse(status=HTTPStatus.OK)
 
 

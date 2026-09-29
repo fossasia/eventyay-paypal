@@ -19,6 +19,9 @@ class PaypalPluginApp(AppConfig):
         description = _("This plugin allows you to receive payments via PayPal.")
 
     def ready(self):
+        from .operational_log import log_plugin_loaded
+
+        log_plugin_loaded("paypal")
         from . import signals  # NOQA
 
 
