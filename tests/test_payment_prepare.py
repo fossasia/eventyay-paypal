@@ -72,3 +72,29 @@ def test_checkout_prepare_clears_order_payment_for_cart_checkout(monkeypatch):
 
     assert result == "https://sandbox.paypal.com/approve"
     assert request.session["payment_paypal_payment"] is None
+
+
+def test_order_payload_includes_payee_for_connected_merchant():
+    provider = Paypal.__new__(Paypal)
+    provider.settings = SimpleNamespace(
+        prefix="",
+        connect_user_id="CONNECT-USER",
+        merchant_id="MERCHANT-1",
+    )
+    provider.event = SimpleNamespace(currency="USD", name="Bare Minimum", slug="baremini")
+    provider._connected_merchant_id = lambda: "MERCHANT-1"
+
+    request = SimpleNamespace(event=provider.event)
+
+    payload = provider._order_payload(
+        request,
+        150,
+        return_url="https://example.test/paypal/return/",
+        cancel_url="https://example.test/paypal/cancel/",
+    )
+
+    purchase_unit = payload["purchase_units"][0]
+
+    assert purchase_unit["payee"] == {"merchant_id": "MERCHANT-1"}
+    assert purchase_unit["amount"]["currency_code"] == "USD"
+    assert purchase_unit["amount"]["value"] == "150.00"
