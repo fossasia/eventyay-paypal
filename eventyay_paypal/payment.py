@@ -57,6 +57,7 @@ def _log_paypal(outcome, error_code=None, event_id=None, order_id=None, action="
         order_id=order_id,
     )
 
+
 SUPPORTED_CURRENCIES = [
     "AUD",
     "BRL",
