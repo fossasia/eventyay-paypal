@@ -78,11 +78,12 @@ def test_order_payload_includes_payee_for_connected_merchant():
     provider = Paypal.__new__(Paypal)
     provider.settings = SimpleNamespace(
         prefix="",
+        connect_client_id="CONNECT-CLIENT",
+        connect_secret_key="CONNECT-SECRET",
         connect_user_id="CONNECT-USER",
         merchant_id="MERCHANT-1",
     )
     provider.event = SimpleNamespace(currency="USD", name="Bare Minimum", slug="baremini")
-    provider._connected_merchant_id = lambda: "MERCHANT-1"
 
     request = SimpleNamespace(event=provider.event)
 
