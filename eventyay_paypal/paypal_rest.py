@@ -11,6 +11,7 @@ import requests
 from cryptography.fernet import Fernet
 from django.core.cache import cache
 
+from .operational_log import logged_request
 from .utils import (
     build_paypal_auth_assertion,
     paypal_error_reason,
@@ -101,7 +102,8 @@ class PaypalRequestHandler:
                 }
             }
         try:
-            response = requests.request(
+            response = logged_request(
+                "paypal",
                 method.value,
                 url,
                 data=data,
