@@ -349,6 +349,13 @@ class Paypal(BasePaymentProvider):
             order_data=self._order_payload(request, amount, return_url=return_url, cancel_url=cancel_url)
         )
         if errors := order_response.get("errors"):
+            error_type = errors.get("type")
+            _log_paypal(
+                OUTCOME_FAILURE,
+                error_type if isinstance(error_type, str) else "paypal_error",
+                event_id=getattr(self.event, "pk", None),
+                order_id=getattr(payment, "order_id", None),
+            )
             messages.error(
                 request,
                 _("An error occurred during connecting with PayPal: {}").format(errors.get("reason", errors)),
@@ -636,6 +643,7 @@ class Paypal(BasePaymentProvider):
             payment.save(update_fields=["info"])
             payment.confirm()
         except Quota.QuotaExceededException as e:
+            _log_paypal(OUTCOME_FAILURE, "quota_exceeded", event_id=self.event.pk, order_id=payment.order_id)
             raise PaymentException(str(e)) from e
         except SendMailException:
             messages.warning(request, _("There was an error sending the confirmation mail."))
@@ -718,6 +726,13 @@ class Paypal(BasePaymentProvider):
             None,
         )
         if not capture_id:
+            _log_paypal(
+                OUTCOME_FAILURE,
+                "missing_capture",
+                event_id=refund.order.event_id,
+                order_id=refund.order_id,
+                action="payment.refund",
+            )
             raise PaymentException(_("An error occurred while communicating with PayPal, please try again."))
         refund_payment = self.paypal_request_handler.refund_payment(
             capture_id=capture_id,
@@ -759,12 +774,6 @@ class Paypal(BasePaymentProvider):
                 action="payment.refund",
             )
             raise PaymentException(_("An error occurred while communicating with PayPal, please try again."))
-        _log_paypal(
-            OUTCOME_SUCCESS,
-            event_id=refund.order.event_id,
-            order_id=refund.order_id,
-            action="payment.refund",
-        )
         refund.info = json.dumps(refund_payment_response)
         refund.save(update_fields=["info"])
 
@@ -774,6 +783,13 @@ class Paypal(BasePaymentProvider):
         )
 
         if errors := refund_detail.get("errors"):
+            _log_paypal(
+                OUTCOME_FAILURE,
+                "refund_detail_failed",
+                event_id=refund.order.event_id,
+                order_id=refund.order_id,
+                action="payment.refund",
+            )
             refund.order.log_action(
                 "eventyay.event.order.refund.failed",
                 {
@@ -791,11 +807,24 @@ class Paypal(BasePaymentProvider):
         refund_status = refund_detail_response.get("status")
         if refund_status == "COMPLETED":
             refund.done()
+            _log_paypal(
+                OUTCOME_SUCCESS,
+                event_id=refund.order.event_id,
+                order_id=refund.order_id,
+                action="payment.refund",
+            )
         elif refund_status == "PENDING":
             refund.state = OrderRefund.REFUND_STATE_TRANSIT
             refund.save(update_fields=["state"])
         else:
             refund_reason = safe_get(refund_detail_response, ["status_details", "reason"], "") or refund_status
+            _log_paypal(
+                OUTCOME_FAILURE,
+                "refund_not_completed",
+                event_id=refund.order.event_id,
+                order_id=refund.order_id,
+                action="payment.refund",
+            )
             refund.order.log_action(
                 "eventyay.event.order.refund.failed",
                 {

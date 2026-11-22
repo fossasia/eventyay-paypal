@@ -9,10 +9,17 @@ Only opaque IDs, status codes, durations, and safe error codes are kept.
 
 from __future__ import annotations
 
-import functools
 import logging
 import re
 import time
+
+import requests
+import requests.api as requests_api
+
+try:
+    from eventyay.base.operational_logging import log_event as _HOST_LOG_EVENT
+except Exception:
+    _HOST_LOG_EVENT = None
 
 OUTCOME_SUCCESS = "success"
 OUTCOME_FAILURE = "failure"
@@ -23,22 +30,15 @@ _INT_FIELDS = frozenset(
     {
         "event_id",
         "order_id",
-        "user_id",
         "status",
         "duration_ms",
-        "retry_count",
-        "webhook_id",
-        "recipient_count",
     }
 )
 _IDENTIFIER_FIELDS = frozenset(
     {
         "error_code",
         "backend",
-        "job_name",
         "payment_provider",
-        "model",
-        "order_code",
     }
 )
 _REQUEST_VERBS = frozenset({"get", "post", "put", "patch", "delete", "head", "options"})
@@ -64,16 +64,6 @@ def _clean(fields):
             cleaned = _safe_identifier(value if isinstance(value, str) else None)
             if cleaned is not None:
                 extra[key] = cleaned
-            continue
-        if key == "object_id":
-            if isinstance(value, bool):
-                continue
-            if isinstance(value, int):
-                extra[key] = value
-            else:
-                cleaned = _safe_identifier(str(value))
-                if cleaned is not None:
-                    extra[key] = cleaned
     return extra
 
 
@@ -86,14 +76,12 @@ def log_operation(action, outcome, **fields):
             outcome = OUTCOME_FAILURE
         level = logging.WARNING if outcome == OUTCOME_FAILURE else logging.INFO
         payload = _clean(fields)
-        emitter = None
-        try:
-            from eventyay.base.operational_logging import log_event as emitter
-        except Exception:
-            emitter = None
-        if emitter is not None:
-            emitter("plugins", action, outcome, level=level, **payload)
-            return
+        if _HOST_LOG_EVENT is not None:
+            try:
+                _HOST_LOG_EVENT("plugins", action, outcome, level=level, **payload)
+                return
+            except Exception:
+                pass
         extra = {
             "component": "plugins",
             "outcome": outcome,
@@ -119,9 +107,6 @@ def _send_request(method, url, **kwargs):
     A patched ``requests.get`` or ``requests.post`` wins. Otherwise a patched
     ``requests.request`` wins. Unpatched calls use the verb helper.
     """
-    import requests
-    import requests.api as requests_api
-
     verb_name = str(method).lower()
     if verb_name in _REQUEST_VERBS:
         patched = getattr(requests, verb_name, None)
@@ -143,8 +128,6 @@ def logged_request(backend, method, url, **kwargs):
     treats a 4xx response as success. The same exception is re-raised.
     The URL and body are not logged.
     """
-    import requests
-
     ok_statuses = kwargs.pop("ok_statuses", ())
     started = time.monotonic()
     try:
@@ -180,29 +163,3 @@ def logged_request(backend, method, url, **kwargs):
         error_code="http_error" if failed else None,
     )
     return response
-
-
-def traced_job(job_name):
-    """Log job boundaries without changing the return value or exception."""
-
-    def decorator(fn):
-        @functools.wraps(fn)
-        def wrapper(*args, **kwargs):
-            log_operation("job.start", OUTCOME_SUCCESS, job_name=job_name)
-            try:
-                result = fn(*args, **kwargs)
-            except Exception as exc:
-                retried = type(exc).__name__ == "Retry"
-                log_operation(
-                    "job.retry" if retried else "job.fail",
-                    OUTCOME_FAILURE,
-                    job_name=job_name,
-                    error_code="retry" if retried else type(exc).__name__,
-                )
-                raise
-            log_operation("job.finish", OUTCOME_SUCCESS, job_name=job_name)
-            return result
-
-        return wrapper
-
-    return decorator
