@@ -188,7 +188,7 @@ class PaypalRequestHandler:
             )
 
             if errors := access_token_response.get("errors"):
-                logger.error("Error getting access token from Paypal: %s", errors.get("reason", errors))
+                logger.error("Error getting access token from Paypal (error_type=%s)", errors.get("type", "unknown"))
                 return {}
 
             access_token_data = access_token_response.get("response") or {}

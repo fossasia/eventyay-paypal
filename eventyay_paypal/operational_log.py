@@ -41,8 +41,10 @@ _INT_FIELDS = frozenset(
     {
         "event_id",
         "order_id",
+        "user_id",
         "status",
         "duration_ms",
+        "retry_count",
     }
 )
 _IDENTIFIER_FIELDS = frozenset(
@@ -52,6 +54,8 @@ _IDENTIFIER_FIELDS = frozenset(
         "payment_provider",
         "request_id",
         "job_id",
+        "route",
+        "model",
     }
 )
 _REQUEST_VERBS = frozenset({"get", "post", "put", "patch", "delete", "head", "options"})
@@ -168,6 +172,7 @@ def logged_request(backend, method, url, **kwargs):
     order_id = kwargs.pop("order_id", None)
     request_id = kwargs.pop("request_id", None)
     job_id = kwargs.pop("job_id", None)
+    retry_count = kwargs.pop("retry_count", None)
     if _safe_identifier(request_id) is None:
         ctx_request_id, _ = _current_correlation_ids()
         request_id = ctx_request_id or uuid.uuid4().hex
@@ -185,6 +190,7 @@ def logged_request(backend, method, url, **kwargs):
             order_id=order_id,
             request_id=request_id,
             job_id=job_id,
+            retry_count=retry_count,
         )
         raise
     except requests.RequestException:
@@ -198,6 +204,7 @@ def logged_request(backend, method, url, **kwargs):
             order_id=order_id,
             request_id=request_id,
             job_id=job_id,
+            retry_count=retry_count,
         )
         raise
     status = getattr(response, "status_code", None)
@@ -215,5 +222,6 @@ def logged_request(backend, method, url, **kwargs):
         order_id=order_id,
         request_id=request_id,
         job_id=job_id,
+        retry_count=retry_count,
     )
     return response

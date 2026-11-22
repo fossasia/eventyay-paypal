@@ -492,7 +492,7 @@ class Paypal(BasePaymentProvider):
         def handle_paypal_error(errors, order_id, payment, message):
             exception = errors.get("exception")
             error_type = errors.get("type")
-            logger.error(message, order_id, errors.get("reason", errors))
+            logger.error(message, order_id, error_type or "unknown")
             _log_paypal(
                 OUTCOME_FAILURE,
                 error_type if isinstance(error_type, str) else "paypal_error",
@@ -768,7 +768,7 @@ class Paypal(BasePaymentProvider):
             merchant_id=self.event.settings.payment_paypal_merchant_id,
         )
         if errors := refund_payment.get("errors"):
-            logger.error("execute_refund: %s", errors.get("reason", errors))
+            logger.error("execute_refund failed (error_type=%s)", errors.get("type", "unknown"))
             _log_paypal(
                 OUTCOME_FAILURE,
                 "refund_failed",

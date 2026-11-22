@@ -514,6 +514,95 @@ def test_logged_request_propagates_correlation_id_without_leaking_kwargs(capture
     assert extra["order_id"] == 99
 
 
+def test_logged_request_records_retry_count_without_leaking_kwargs(captured, monkeypatch):
+    seen_kwargs = {}
+
+    class Response:
+        status_code = 200
+
+    def fake_get(url, **kwargs):
+        seen_kwargs.update(kwargs)
+        return Response()
+
+    monkeypatch.setattr(requests, "get", fake_get)
+    logged_request(
+        "paypal",
+        "GET",
+        "https://example.invalid/v2/checkout/orders/ORD-1",
+        retry_count=2,
+        event_id=12,
+    )
+
+    assert seen_kwargs == {}
+    assert len(captured) == 1
+    assert captured[0][2]["retry_count"] == 2
+
+
+def test_execute_refund_error_sanitizes_logger_call(captured, monkeypatch):
+    from eventyay_paypal import payment as payment_module
+
+    logged_errors = []
+    monkeypatch.setattr(payment_module.logger, "error", lambda *args, **kwargs: logged_errors.append((args, kwargs)))
+
+    handler = MagicMock()
+    handler.refund_payment.return_value = {
+        "errors": {
+            "type": "UnprocessableEntity",
+            "reason": "Refund refused for buyer-secret@example.com",
+        }
+    }
+    provider = _make_refund_provider(handler)
+    refund = _make_refund()
+
+    with pytest.raises(PaymentException):
+        provider.execute_refund(refund)
+
+    assert "buyer-secret@example.com" not in str(logged_errors)
+    assert "UnprocessableEntity" in str(logged_errors)
+    assert len(captured) == 1
+    assert captured[0][1] == "payment.refund"
+    assert captured[0][2]["outcome"] == OUTCOME_FAILURE
+    assert captured[0][2]["error_code"] == "refund_failed"
+
+
+def test_permission_denied_logs_for_authenticated_user_only(captured):
+    authed_request = SimpleNamespace(
+        method="GET",
+        event=SimpleNamespace(pk=12),
+        organizer=SimpleNamespace(),
+        user=SimpleNamespace(
+            pk=77,
+            is_authenticated=True,
+            has_event_permission=lambda *_a, **_kw: False,
+        ),
+    )
+    with pytest.raises(views.PermissionDenied):
+        views.oauth_start(authed_request)
+
+    assert len(captured) == 1
+    assert captured[0][1] == "permission.denied"
+    assert captured[0][2]["outcome"] == OUTCOME_FAILURE
+    assert captured[0][2]["error_code"] == "forbidden"
+    assert captured[0][2]["route"] == "oauth.start"
+    assert captured[0][2]["event_id"] == 12
+    assert captured[0][2]["user_id"] == 77
+
+    unauthed_request = SimpleNamespace(
+        method="GET",
+        event=SimpleNamespace(pk=12),
+        organizer=SimpleNamespace(),
+        user=SimpleNamespace(
+            pk=None,
+            is_authenticated=False,
+            has_event_permission=lambda *_a, **_kw: False,
+        ),
+    )
+    with pytest.raises(views.PermissionDenied):
+        views.oauth_start(unauthed_request)
+
+    assert len(captured) == 1
+
+
 def test_store_paypal_connection_logs_lifecycle_without_pii(captured):
     fake_settings = SimpleNamespace(payment_paypal_connect_tracking_id="TRACK-1")
     fake_event = SimpleNamespace(pk=12, settings=fake_settings)

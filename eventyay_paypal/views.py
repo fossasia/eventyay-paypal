@@ -3,10 +3,12 @@ import json
 import logging
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from functools import wraps
 from http import HTTPStatus
 
 from django.contrib import messages
 from django.core import signing
+from django.core.exceptions import PermissionDenied
 from django.db.models import Sum
 from django.http import HttpResponse, HttpResponseBadRequest
 from django.shortcuts import get_object_or_404, redirect, render
@@ -103,6 +105,33 @@ def warn_about_open_paypal_items(request, merchant_info: dict):
         )
 
 
+def _log_permission_denied(route_name):
+    def decorator(view_func):
+        @wraps(view_func)
+        def _wrapped(request, *args, **kwargs):
+            try:
+                return view_func(request, *args, **kwargs)
+            except PermissionDenied:
+                user = getattr(request, "user", None)
+                if getattr(user, "is_authenticated", False):
+                    log_operation(
+                        "permission.denied",
+                        OUTCOME_FAILURE,
+                        backend="paypal",
+                        payment_provider="paypal",
+                        error_code="forbidden",
+                        route=route_name,
+                        event_id=getattr(getattr(request, "event", None), "pk", None),
+                        user_id=getattr(user, "pk", None),
+                    )
+                raise
+
+        return _wrapped
+
+    return decorator
+
+
+@_log_permission_denied("oauth.start")
 @event_permission_required("can_change_event_settings")
 @require_GET
 def oauth_start(request, **kwargs):
@@ -143,6 +172,7 @@ def oauth_start(request, **kwargs):
     return redirect(url)
 
 
+@_log_permission_denied("oauth.return")
 @scopes_disabled()
 def oauth_return(request, *args, **kwargs):
     """
@@ -238,8 +268,8 @@ def oauth_return(request, *args, **kwargs):
             display_name = info.get("primary_email") or info.get("merchant_id") or merchant_id
         else:
             logger.warning(
-                "Unable to fetch merchant display name from PayPal: %s",
-                merchant_info["errors"].get("reason", merchant_info["errors"]),
+                "Unable to fetch merchant display name from PayPal (error_type=%s)",
+                merchant_info["errors"].get("type", "unknown"),
             )
     account_is_ready = paypal_merchant_can_receive_payments(info)
     store_paypal_connection(event, merchant_id, display_name, enable=account_is_ready)
@@ -264,6 +294,7 @@ def oauth_return(request, *args, **kwargs):
     return redirect_to_paypal_settings(event)
 
 
+@_log_permission_denied("oauth.status")
 @event_permission_required("can_change_event_settings")
 @require_POST
 def oauth_status(request, **kwargs):
@@ -327,9 +358,9 @@ def oauth_status(request, **kwargs):
     )
     if errors := integration.get("errors"):
         logger.warning(
-            "PayPal did not confirm the onboarding for event %s: %s",
+            "PayPal did not confirm the onboarding for event %s (error_type=%s)",
             event.pk,
-            errors.get("reason", errors),
+            errors.get("type", "unknown"),
         )
         log_operation(
             "oauth.status",
@@ -513,7 +544,7 @@ def check_webhook_signature(request, event, event_json, prov) -> bool:
     )
 
     if errors := verify_response.get("errors"):
-        logger.error("Unable to verify signature of webhook: %s", errors.get("reason", errors))
+        logger.error("Unable to verify signature of webhook (error_type=%s)", errors.get("type", "unknown"))
         return False
     if safe_get(verify_response, ["response", "verification_status"], "") != "SUCCESS":
         logger.error("Unable to verify signature of webhook")
@@ -580,10 +611,10 @@ def extract_order_and_payment(payment_id, event, event_json, prov, rpo=None):
     order_response = prov.paypal_request_handler.get_order(order_id=payment_id)
     if errors := order_response.get("errors"):
         logger.error(
-            "Paypal error on webhook for event %s (event_type=%s): %s",
+            "Paypal error on webhook for event %s (event_type=%s, error_type=%s)",
             getattr(event, "pk", None),
             event_json.get("event_type"),
-            errors.get("reason", errors),
+            errors.get("type", "unknown"),
         )
         return order_detail, payment
 
@@ -701,10 +732,10 @@ def webhook(request, *args, **kwargs):
         )
         if errors := refund_response.get("errors"):
             logger.error(
-                "Paypal refund lookup error on webhook for event %s order %s: %s",
+                "Paypal refund lookup error on webhook for event %s order %s (error_type=%s)",
                 event.pk,
                 payment.order_id,
-                errors.get("reason", errors),
+                errors.get("type", "unknown"),
             )
             return HttpResponse(f"Refund {refund_id_in_event} not found", status=HTTPStatus.BAD_REQUEST)
 
@@ -831,6 +862,7 @@ def webhook(request, *args, **kwargs):
     return HttpResponse(status=HTTPStatus.OK)
 
 
+@_log_permission_denied("oauth.disconnect")
 @event_permission_required("can_change_event_settings")
 def oauth_disconnect(request, **kwargs):
     if request.method != "POST":
