@@ -76,6 +76,13 @@ def store_paypal_connection(event, merchant_id: str, display_name: str | None = 
     if enable:
         event.settings.payment_paypal__enabled = True
     del event.settings.payment_paypal_connect_tracking_id
+    log_operation(
+        "plugin.enabled" if enable else "plugin.configured",
+        OUTCOME_SUCCESS,
+        backend="paypal",
+        payment_provider="paypal",
+        event_id=event.pk,
+    )
 
 
 def warn_about_open_paypal_items(request, merchant_info: dict):
@@ -344,7 +351,6 @@ def oauth_status(request, **kwargs):
     info = integration.get("response") or {}
     merchant_id = info.get("merchant_id")
     if not merchant_id or (info.get("tracking_id") and info["tracking_id"] != tracking_id):
-        logger.warning("PayPal onboarding lookup for event %s returned %s", event.pk, info)
         log_operation(
             "oauth.status",
             OUTCOME_FAILURE,
@@ -573,7 +579,12 @@ def extract_order_and_payment(payment_id, event, event_json, prov, rpo=None):
 
     order_response = prov.paypal_request_handler.get_order(order_id=payment_id)
     if errors := order_response.get("errors"):
-        logger.error("Paypal error on webhook: %s event=%s", errors.get("reason", errors), event_json)
+        logger.error(
+            "Paypal error on webhook for event %s (event_type=%s): %s",
+            getattr(event, "pk", None),
+            event_json.get("event_type"),
+            errors.get("reason", errors),
+        )
         return order_detail, payment
 
     order_detail = order_response.get("response")
@@ -689,7 +700,12 @@ def webhook(request, *args, **kwargs):
             merchant_id=event.settings.payment_paypal_merchant_id,
         )
         if errors := refund_response.get("errors"):
-            logger.error("Paypal error on webhook: %s event=%s", errors.get("reason", errors), event_json)
+            logger.error(
+                "Paypal refund lookup error on webhook for event %s order %s: %s",
+                event.pk,
+                payment.order_id,
+                errors.get("reason", errors),
+            )
             return HttpResponse(f"Refund {refund_id_in_event} not found", status=HTTPStatus.BAD_REQUEST)
 
         refund_detail = refund_response.get("response")
@@ -830,6 +846,13 @@ def oauth_disconnect(request, **kwargs):
     request.event.settings.payment_paypal__enabled = False
     log_operation(
         "oauth.disconnect",
+        OUTCOME_SUCCESS,
+        backend="paypal",
+        payment_provider="paypal",
+        event_id=request.event.pk,
+    )
+    log_operation(
+        "plugin.disabled",
         OUTCOME_SUCCESS,
         backend="paypal",
         payment_provider="paypal",

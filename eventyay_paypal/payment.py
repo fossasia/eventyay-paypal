@@ -450,7 +450,12 @@ class Paypal(BasePaymentProvider):
     def _create_order(self, request, order):
         if not order or order.get("status") not in ("CREATED", "PAYER_ACTION_REQUIRED"):
             messages.error(request, _("We had trouble communicating with PayPal"))
-            logger.error("Invalid order state: %s", order)
+            logger.error(
+                "Invalid order state for event %s: paypal_order_id=%s status=%s",
+                getattr(request.event, "pk", None),
+                order.get("id") if isinstance(order, dict) else None,
+                order.get("status") if isinstance(order, dict) else None,
+            )
             _log_paypal(OUTCOME_FAILURE, "invalid_order_state", event_id=getattr(request.event, "pk", None))
             return
 
@@ -466,7 +471,11 @@ class Paypal(BasePaymentProvider):
                 )
             return str(href)
         messages.error(request, _("We had trouble communicating with PayPal"))
-        logger.error("PayPal order %s did not include an approval URL: %s", order.get("id"), order)
+        logger.error(
+            "PayPal order %s did not include an approval URL (status=%s)",
+            order.get("id"),
+            order.get("status"),
+        )
         _log_paypal(OUTCOME_FAILURE, "missing_approval_url", event_id=getattr(request.event, "pk", None))
         return None
 
@@ -540,9 +549,11 @@ class Paypal(BasePaymentProvider):
             _amounts_match = False
         if not _amounts_match or safe_get(_unit, ["amount", "currency_code"]) != self.event.currency:
             logger.error(
-                "Value mismatch: Payment %s vs paypal trans %s",
+                "Value mismatch for payment %s (order %s): paypal_order_id=%s status=%s",
                 payment.id,
-                str(order_detail),
+                payment.order_id,
+                order_detail.get("id"),
+                order_detail.get("status"),
             )
             _log_paypal(OUTCOME_FAILURE, "amount_mismatch", event_id=self.event.pk, order_id=payment.order_id)
             payment.fail(
@@ -618,7 +629,13 @@ class Paypal(BasePaymentProvider):
                         return
         else:
             payment.fail(info=order_detail)
-            logger.error("Invalid PayPal order state: %s", order_detail)
+            logger.error(
+                "Invalid PayPal order state for payment %s (order %s): paypal_order_id=%s status=%s",
+                payment.id,
+                payment.order_id,
+                order_detail.get("id"),
+                order_detail.get("status"),
+            )
             _log_paypal(OUTCOME_FAILURE, "invalid_order_state", event_id=self.event.pk, order_id=payment.order_id)
             raise PaymentException(
                 _("We were unable to process your payment. See below for details on how to proceed.")
@@ -627,7 +644,13 @@ class Paypal(BasePaymentProvider):
         payment.refresh_from_db()
         if not captured_order or captured_order.get("status") != "COMPLETED":
             payment.fail(info=captured_order)
-            logger.error("Invalid state: %s", repr(captured_order))
+            logger.error(
+                "Invalid PayPal capture state for payment %s (order %s): paypal_order_id=%s status=%s",
+                payment.id,
+                payment.order_id,
+                captured_order.get("id") if isinstance(captured_order, dict) else None,
+                captured_order.get("status") if isinstance(captured_order, dict) else None,
+            )
             _log_paypal(OUTCOME_FAILURE, "invalid_capture_state", event_id=self.event.pk, order_id=payment.order_id)
             raise PaymentException(
                 _("We were unable to process your payment. See below for details on how to proceed.")

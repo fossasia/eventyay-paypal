@@ -101,6 +101,7 @@ class PaypalRequestHandler:
                     "exception": None,
                 }
             }
+        correlation_id = (headers or {}).get("PayPal-Request-Id") or self.paypal_request_id
         try:
             response = logged_request(
                 "paypal",
@@ -110,6 +111,7 @@ class PaypalRequestHandler:
                 params=params,
                 headers=headers,
                 timeout=timeout,
+                request_id=correlation_id,
             )
 
             reason = paypal_error_reason(response, fallback=response.reason)

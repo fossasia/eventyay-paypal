@@ -12,14 +12,25 @@ from __future__ import annotations
 import logging
 import re
 import time
+import uuid
 
 import requests
 import requests.api as requests_api
 
 try:
-    from eventyay.base.operational_logging import log_event as _HOST_LOG_EVENT
+    from eventyay.base.operational_logging import (
+        get_job_id as _HOST_GET_JOB_ID,
+    )
+    from eventyay.base.operational_logging import (
+        get_request_id as _HOST_GET_REQUEST_ID,
+    )
+    from eventyay.base.operational_logging import (
+        log_event as _HOST_LOG_EVENT,
+    )
 except Exception:
     _HOST_LOG_EVENT = None
+    _HOST_GET_REQUEST_ID = None
+    _HOST_GET_JOB_ID = None
 
 OUTCOME_SUCCESS = "success"
 OUTCOME_FAILURE = "failure"
@@ -39,6 +50,8 @@ _IDENTIFIER_FIELDS = frozenset(
         "error_code",
         "backend",
         "payment_provider",
+        "request_id",
+        "job_id",
     }
 )
 _REQUEST_VERBS = frozenset({"get", "post", "put", "patch", "delete", "head", "options"})
@@ -48,6 +61,22 @@ def _safe_identifier(value):
     if isinstance(value, str) and _SAFE_IDENTIFIER.fullmatch(value):
         return value
     return None
+
+
+def _current_correlation_ids():
+    request_id = None
+    job_id = None
+    if _HOST_GET_REQUEST_ID is not None:
+        try:
+            request_id = _safe_identifier(_HOST_GET_REQUEST_ID())
+        except Exception:
+            request_id = None
+    if _HOST_GET_JOB_ID is not None:
+        try:
+            job_id = _safe_identifier(_HOST_GET_JOB_ID())
+        except Exception:
+            job_id = None
+    return request_id, job_id
 
 
 def _clean(fields):
@@ -76,6 +105,11 @@ def log_operation(action, outcome, **fields):
             outcome = OUTCOME_FAILURE
         level = logging.WARNING if outcome == OUTCOME_FAILURE else logging.INFO
         payload = _clean(fields)
+        ctx_request_id, ctx_job_id = _current_correlation_ids()
+        if ctx_request_id and "request_id" not in payload:
+            payload["request_id"] = ctx_request_id
+        if ctx_job_id and "job_id" not in payload:
+            payload["job_id"] = ctx_job_id
         if _HOST_LOG_EVENT is not None:
             try:
                 _HOST_LOG_EVENT("plugins", action, outcome, level=level, **payload)
@@ -124,11 +158,19 @@ def _send_request(method, url, **kwargs):
 def logged_request(backend, method, url, **kwargs):
     """Log status and duration for one HTTP call.
 
-    ``ok_statuses`` is not sent to the server. Use it when the caller already
-    treats a 4xx response as success. The same exception is re-raised.
-    The URL and body are not logged.
+    ``ok_statuses`` and operational correlation fields (``event_id``,
+    ``order_id``, ``request_id``, ``job_id``) are popped before forwarding
+    ``kwargs`` to ``requests``. The same exception is re-raised. The URL and
+    body are not logged.
     """
     ok_statuses = kwargs.pop("ok_statuses", ())
+    event_id = kwargs.pop("event_id", None)
+    order_id = kwargs.pop("order_id", None)
+    request_id = kwargs.pop("request_id", None)
+    job_id = kwargs.pop("job_id", None)
+    if _safe_identifier(request_id) is None:
+        ctx_request_id, _ = _current_correlation_ids()
+        request_id = ctx_request_id or uuid.uuid4().hex
     started = time.monotonic()
     try:
         response = _send_request(method, url, **kwargs)
@@ -139,6 +181,10 @@ def logged_request(backend, method, url, **kwargs):
             backend=backend,
             error_code="timeout",
             duration_ms=_elapsed_ms(started),
+            event_id=event_id,
+            order_id=order_id,
+            request_id=request_id,
+            job_id=job_id,
         )
         raise
     except requests.RequestException:
@@ -148,6 +194,10 @@ def logged_request(backend, method, url, **kwargs):
             backend=backend,
             error_code="request_error",
             duration_ms=_elapsed_ms(started),
+            event_id=event_id,
+            order_id=order_id,
+            request_id=request_id,
+            job_id=job_id,
         )
         raise
     status = getattr(response, "status_code", None)
@@ -161,5 +211,9 @@ def logged_request(backend, method, url, **kwargs):
         status=status if status_ok else None,
         duration_ms=_elapsed_ms(started),
         error_code="http_error" if failed else None,
+        event_id=event_id,
+        order_id=order_id,
+        request_id=request_id,
+        job_id=job_id,
     )
     return response

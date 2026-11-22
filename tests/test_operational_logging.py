@@ -406,3 +406,122 @@ def test_oauth_return_logs_without_pii(captured, monkeypatch):
     assert captured[0][2]["event_id"] == 12
     assert "merchant@example.com" not in str(captured)
     assert "TRACK-1" not in str(captured)
+
+
+def test_oauth_status_invalid_merchant_info_does_not_log_pii(captured, monkeypatch):
+    logged_warnings = []
+    monkeypatch.setattr(views.logger, "warning", lambda *args, **kwargs: logged_warnings.append((args, kwargs)))
+
+    fake_settings = SimpleNamespace(
+        payment_paypal_connect_user_id="",
+        get=lambda key, default=None: {
+            "payment_paypal_connect_tracking_id": "TRACK-1",
+            "payment_paypal_connect_partner_payer_id": "PARTNER-1",
+        }.get(key, default),
+    )
+    fake_event = SimpleNamespace(pk=12, settings=fake_settings)
+    fake_provider = SimpleNamespace(
+        connect_configured=lambda: True,
+        paypal_request_handler=SimpleNamespace(
+            find_merchant_integration=lambda **_kw: {
+                "response": {
+                    "merchant_id": "",
+                    "tracking_id": "WRONG-TRACK",
+                    "primary_email": "merchant-secret@example.com",
+                }
+            }
+        ),
+    )
+    monkeypatch.setattr(views, "Paypal", lambda _ev: fake_provider)
+    monkeypatch.setattr(views.messages, "warning", MagicMock())
+    monkeypatch.setattr(views, "redirect_to_paypal_settings", lambda _ev: SimpleNamespace(status_code=302))
+
+    request = SimpleNamespace(
+        method="POST",
+        event=fake_event,
+        organizer=SimpleNamespace(),
+        user=SimpleNamespace(is_authenticated=True, has_event_permission=lambda *_a, **_kw: True),
+    )
+    resp = views.oauth_status(request)
+
+    assert resp.status_code == 302
+    assert "merchant-secret@example.com" not in str(logged_warnings)
+    assert "merchant-secret@example.com" not in str(captured)
+    assert len(captured) == 1
+    assert captured[0][1] == "oauth.status"
+    assert captured[0][2]["outcome"] == OUTCOME_FAILURE
+    assert captured[0][2]["error_code"] == "invalid_merchant_info"
+    assert captured[0][2]["event_id"] == 12
+
+
+def test_create_order_invalid_state_does_not_log_raw_order_payload(captured, monkeypatch):
+    from eventyay_paypal import payment as payment_module
+
+    logged_errors = []
+    monkeypatch.setattr(payment_module.logger, "error", lambda *args, **kwargs: logged_errors.append((args, kwargs)))
+    monkeypatch.setattr(payment_module.messages, "error", MagicMock())
+
+    provider = Paypal.__new__(Paypal)
+    request = SimpleNamespace(event=SimpleNamespace(pk=12), session={})
+    raw_order = {
+        "id": "ORD-123",
+        "status": "VOIDED",
+        "payer": {
+            "email_address": "buyer-secret@example.com",
+            "name": {"given_name": "Alice", "surname": "Secret"},
+        },
+    }
+
+    provider._create_order(request, raw_order)
+
+    assert "buyer-secret@example.com" not in str(logged_errors)
+    assert "Alice" not in str(logged_errors)
+    assert "buyer-secret@example.com" not in str(captured)
+    assert len(captured) == 1
+    assert captured[0][1] == "payment.charge"
+    assert captured[0][2]["outcome"] == OUTCOME_FAILURE
+    assert captured[0][2]["error_code"] == "invalid_order_state"
+
+
+def test_logged_request_propagates_correlation_id_without_leaking_kwargs(captured, monkeypatch):
+    seen_kwargs = {}
+
+    class Response:
+        status_code = 200
+
+    def fake_post(url, **kwargs):
+        seen_kwargs.update(kwargs)
+        return Response()
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    logged_request(
+        "paypal",
+        "POST",
+        "https://example.invalid/v2/checkout/orders",
+        request_id="corr-123",
+        job_id="job-456",
+        event_id=12,
+        order_id=99,
+        json={"intent": "CAPTURE"},
+    )
+
+    assert seen_kwargs == {"json": {"intent": "CAPTURE"}}
+    assert len(captured) == 1
+    extra = captured[0][2]
+    assert extra["request_id"] == "corr-123"
+    assert extra["job_id"] == "job-456"
+    assert extra["event_id"] == 12
+    assert extra["order_id"] == 99
+
+
+def test_store_paypal_connection_logs_lifecycle_without_pii(captured):
+    fake_settings = SimpleNamespace(payment_paypal_connect_tracking_id="TRACK-1")
+    fake_event = SimpleNamespace(pk=12, settings=fake_settings)
+
+    views.store_paypal_connection(fake_event, "MERCHANT-1", "merchant@example.com", enable=True)
+
+    assert len(captured) == 1
+    assert captured[0][1] == "plugin.enabled"
+    assert captured[0][2]["outcome"] == OUTCOME_SUCCESS
+    assert captured[0][2]["event_id"] == 12
+    assert "merchant@example.com" not in str(captured)
