@@ -11,6 +11,7 @@ import requests
 from cryptography.fernet import Fernet
 from django.core.cache import cache
 
+from .operational_log import logged_request
 from .utils import (
     build_paypal_auth_assertion,
     paypal_error_reason,
@@ -100,14 +101,17 @@ class PaypalRequestHandler:
                     "exception": None,
                 }
             }
+        correlation_id = (headers or {}).get("PayPal-Request-Id") or self.paypal_request_id
         try:
-            response = requests.request(
+            response = logged_request(
+                "paypal",
                 method.value,
                 url,
                 data=data,
                 params=params,
                 headers=headers,
                 timeout=timeout,
+                request_id=correlation_id,
             )
 
             reason = paypal_error_reason(response, fallback=response.reason)
@@ -184,7 +188,7 @@ class PaypalRequestHandler:
             )
 
             if errors := access_token_response.get("errors"):
-                logger.error("Error getting access token from Paypal: %s", errors.get("reason", errors))
+                logger.error("Error getting access token from Paypal (error_type=%s)", errors.get("type", "unknown"))
                 return {}
 
             access_token_data = access_token_response.get("response") or {}

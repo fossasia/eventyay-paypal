@@ -3,10 +3,12 @@ import json
 import logging
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from functools import wraps
 from http import HTTPStatus
 
 from django.contrib import messages
 from django.core import signing
+from django.core.exceptions import PermissionDenied
 from django.db.models import Sum
 from django.http import HttpResponse, HttpResponseBadRequest
 from django.shortcuts import get_object_or_404, redirect, render
@@ -22,6 +24,7 @@ from eventyay.control.permissions import event_permission_required
 from eventyay.multidomain.urlreverse import eventreverse
 
 from .models import ReferencedPayPalObject
+from .operational_log import OUTCOME_FAILURE, OUTCOME_SUCCESS, log_operation
 from .payment import Paypal
 from .utils import paypal_merchant_can_receive_payments, safe_get
 
@@ -75,6 +78,13 @@ def store_paypal_connection(event, merchant_id: str, display_name: str | None = 
     if enable:
         event.settings.payment_paypal__enabled = True
     del event.settings.payment_paypal_connect_tracking_id
+    log_operation(
+        "plugin.enabled" if enable else "plugin.configured",
+        OUTCOME_SUCCESS,
+        backend="paypal",
+        payment_provider="paypal",
+        event_id=event.pk,
+    )
 
 
 def warn_about_open_paypal_items(request, merchant_info: dict):
@@ -95,12 +105,47 @@ def warn_about_open_paypal_items(request, merchant_info: dict):
         )
 
 
+def _log_permission_denied(route_name):
+    def decorator(view_func):
+        @wraps(view_func)
+        def _wrapped(request, *args, **kwargs):
+            try:
+                return view_func(request, *args, **kwargs)
+            except PermissionDenied:
+                user = getattr(request, "user", None)
+                if getattr(user, "is_authenticated", False):
+                    log_operation(
+                        "permission.denied",
+                        OUTCOME_FAILURE,
+                        backend="paypal",
+                        payment_provider="paypal",
+                        error_code="forbidden",
+                        route=route_name,
+                        event_id=getattr(getattr(request, "event", None), "pk", None),
+                        user_id=getattr(user, "pk", None),
+                    )
+                raise
+
+        return _wrapped
+
+    return decorator
+
+
+@_log_permission_denied("oauth.start")
 @event_permission_required("can_change_event_settings")
 @require_GET
 def oauth_start(request, **kwargs):
     """Start PayPal Connect onboarding without calling PayPal during settings render."""
     prov = Paypal(request.event)
     if not prov.connect_configured():
+        log_operation(
+            "oauth.connect",
+            OUTCOME_FAILURE,
+            backend="paypal",
+            payment_provider="paypal",
+            error_code="connect_not_configured",
+            event_id=request.event.pk,
+        )
         messages.error(
             request,
             _("PayPal Connect is not yet configured. Please ask your administrator to set up the credentials."),
@@ -108,10 +153,26 @@ def oauth_start(request, **kwargs):
         return redirect_to_paypal_settings(request.event)
     url = prov.get_connect_url(request)
     if not url:
+        log_operation(
+            "oauth.connect",
+            OUTCOME_FAILURE,
+            backend="paypal",
+            payment_provider="paypal",
+            error_code="connect_url_failed",
+            event_id=request.event.pk,
+        )
         return redirect_to_paypal_settings(request.event)
+    log_operation(
+        "oauth.connect",
+        OUTCOME_SUCCESS,
+        backend="paypal",
+        payment_provider="paypal",
+        event_id=request.event.pk,
+    )
     return redirect(url)
 
 
+@_log_permission_denied("oauth.return")
 @scopes_disabled()
 def oauth_return(request, *args, **kwargs):
     """
@@ -119,6 +180,13 @@ def oauth_return(request, *args, **kwargs):
     Reference for seller onboarding
     """
     if request.GET.get("error"):
+        log_operation(
+            "oauth.callback",
+            OUTCOME_FAILURE,
+            backend="paypal",
+            payment_provider="paypal",
+            error_code="provider_error",
+        )
         messages.error(
             request,
             _("PayPal returned an error: {}").format(request.GET.get("error_description") or request.GET.get("error")),
@@ -137,6 +205,13 @@ def oauth_return(request, *args, **kwargs):
     if any(p not in request.session for p in required_session_params) or any(
         p not in request.GET for p in required_params
     ):
+        log_operation(
+            "oauth.callback",
+            OUTCOME_FAILURE,
+            backend="paypal",
+            payment_provider="paypal",
+            error_code="missing_params",
+        )
         messages.error(
             request,
             _("An error occurred during connecting with PayPal, please try again."),
@@ -144,6 +219,13 @@ def oauth_return(request, *args, **kwargs):
         return redirect(reverse("control:index"))
 
     if request.GET.get("permissionsGranted") != "true":
+        log_operation(
+            "oauth.callback",
+            OUTCOME_FAILURE,
+            backend="paypal",
+            payment_provider="paypal",
+            error_code="permissions_denied",
+        )
         messages.error(
             request,
             _("PayPal permissions were not granted. Please try connecting again and approve the requested access."),
@@ -153,6 +235,13 @@ def oauth_return(request, *args, **kwargs):
     tracking_id = request.session.get("payment_paypal_tracking_id")
     # Partner Referrals returns merchantId as the tracking_id we issued for this onboarding.
     if request.GET.get("merchantId") != tracking_id:
+        log_operation(
+            "oauth.callback",
+            OUTCOME_FAILURE,
+            backend="paypal",
+            payment_provider="paypal",
+            error_code="tracking_mismatch",
+        )
         messages.error(
             request,
             _("An error occurred during connecting with PayPal, please try again."),
@@ -179,8 +268,8 @@ def oauth_return(request, *args, **kwargs):
             display_name = info.get("primary_email") or info.get("merchant_id") or merchant_id
         else:
             logger.warning(
-                "Unable to fetch merchant display name from PayPal: %s",
-                merchant_info["errors"].get("reason", merchant_info["errors"]),
+                "Unable to fetch merchant display name from PayPal (error_type=%s)",
+                merchant_info["errors"].get("type", "unknown"),
             )
     account_is_ready = paypal_merchant_can_receive_payments(info)
     store_paypal_connection(event, merchant_id, display_name, enable=account_is_ready)
@@ -188,6 +277,13 @@ def oauth_return(request, *args, **kwargs):
     for key in required_session_params:
         request.session.pop(key, None)
 
+    log_operation(
+        "oauth.callback",
+        OUTCOME_SUCCESS,
+        backend="paypal",
+        payment_provider="paypal",
+        event_id=event.pk,
+    )
     messages.success(
         request,
         _("Your PayPal account is now connected to Eventyay. You can change the settings in detail below."),
@@ -198,6 +294,7 @@ def oauth_return(request, *args, **kwargs):
     return redirect_to_paypal_settings(event)
 
 
+@_log_permission_denied("oauth.status")
 @event_permission_required("can_change_event_settings")
 @require_POST
 def oauth_status(request, **kwargs):
@@ -205,6 +302,14 @@ def oauth_status(request, **kwargs):
     event = request.event
     prov = Paypal(event)
     if not prov.connect_configured():
+        log_operation(
+            "oauth.status",
+            OUTCOME_FAILURE,
+            backend="paypal",
+            payment_provider="paypal",
+            error_code="connect_not_configured",
+            event_id=event.pk,
+        )
         messages.error(
             request,
             _("PayPal Connect is not yet configured. Please ask your administrator to set up the credentials."),
@@ -217,11 +322,27 @@ def oauth_status(request, **kwargs):
 
     tracking_id = event.settings.get("payment_paypal_connect_tracking_id")
     if not tracking_id:
+        log_operation(
+            "oauth.status",
+            OUTCOME_FAILURE,
+            backend="paypal",
+            payment_provider="paypal",
+            error_code="missing_tracking_id",
+            event_id=event.pk,
+        )
         messages.error(request, _("Please start the connection with PayPal first."))
         return redirect_to_paypal_settings(event)
 
     partner_payer_id = event.settings.get("payment_paypal_connect_partner_payer_id")
     if not partner_payer_id:
+        log_operation(
+            "oauth.status",
+            OUTCOME_FAILURE,
+            backend="paypal",
+            payment_provider="paypal",
+            error_code="missing_partner_payer_id",
+            event_id=event.pk,
+        )
         messages.error(
             request,
             _(
@@ -237,9 +358,17 @@ def oauth_status(request, **kwargs):
     )
     if errors := integration.get("errors"):
         logger.warning(
-            "PayPal did not confirm the onboarding for event %s: %s",
+            "PayPal did not confirm the onboarding for event %s (error_type=%s)",
             event.pk,
-            errors.get("reason", errors),
+            errors.get("type", "unknown"),
+        )
+        log_operation(
+            "oauth.status",
+            OUTCOME_FAILURE,
+            backend="paypal",
+            payment_provider="paypal",
+            error_code="lookup_failed",
+            event_id=event.pk,
         )
         messages.warning(
             request,
@@ -253,12 +382,26 @@ def oauth_status(request, **kwargs):
     info = integration.get("response") or {}
     merchant_id = info.get("merchant_id")
     if not merchant_id or (info.get("tracking_id") and info["tracking_id"] != tracking_id):
-        logger.warning("PayPal onboarding lookup for event %s returned %s", event.pk, info)
+        log_operation(
+            "oauth.status",
+            OUTCOME_FAILURE,
+            backend="paypal",
+            payment_provider="paypal",
+            error_code="invalid_merchant_info",
+            event_id=event.pk,
+        )
         messages.warning(request, _("PayPal did not return a merchant ID for this onboarding yet."))
         return redirect_to_paypal_settings(event)
 
     account_is_ready = paypal_merchant_can_receive_payments(info)
     store_paypal_connection(event, merchant_id, info.get("primary_email") or merchant_id, enable=account_is_ready)
+    log_operation(
+        "oauth.status",
+        OUTCOME_SUCCESS,
+        backend="paypal",
+        payment_provider="paypal",
+        event_id=event.pk,
+    )
     messages.success(request, _("Your PayPal account is now connected to Eventyay."))
     if not account_is_ready:
         warn_about_open_paypal_items(request, info)
@@ -295,6 +438,15 @@ def success(request, *args, **kwargs):
             if resp:
                 return resp
     else:
+        log_operation(
+            "payment.charge",
+            OUTCOME_FAILURE,
+            backend="paypal",
+            payment_provider="paypal",
+            error_code="missing_order",
+            event_id=getattr(request.event, "pk", None),
+            order_id=getattr(payment, "order_id", None),
+        )
         messages.error(request, _("Invalid response from PayPal received."))
         logger.error("Session did not contain payment_paypal_order_id")
         urlkwargs["step"] = "payment"
@@ -320,6 +472,16 @@ def abort(request, *args, **kwargs):
         payment = OrderPayment.objects.get(pk=request.session.get("payment_paypal_payment"))
     else:
         payment = None
+
+    log_operation(
+        "payment.abort",
+        OUTCOME_FAILURE,
+        backend="paypal",
+        payment_provider="paypal",
+        error_code="user_canceled",
+        event_id=getattr(request.event, "pk", None),
+        order_id=getattr(payment, "order_id", None),
+    )
 
     if payment:
         return redirect(
@@ -382,7 +544,7 @@ def check_webhook_signature(request, event, event_json, prov) -> bool:
     )
 
     if errors := verify_response.get("errors"):
-        logger.error("Unable to verify signature of webhook: %s", errors.get("reason", errors))
+        logger.error("Unable to verify signature of webhook (error_type=%s)", errors.get("type", "unknown"))
         return False
     if safe_get(verify_response, ["response", "verification_status"], "") != "SUCCESS":
         logger.error("Unable to verify signature of webhook")
@@ -448,7 +610,12 @@ def extract_order_and_payment(payment_id, event, event_json, prov, rpo=None):
 
     order_response = prov.paypal_request_handler.get_order(order_id=payment_id)
     if errors := order_response.get("errors"):
-        logger.error("Paypal error on webhook: %s event=%s", errors.get("reason", errors), event_json)
+        logger.error(
+            "Paypal error on webhook for event %s (event_type=%s, error_type=%s)",
+            getattr(event, "pk", None),
+            event_json.get("event_type"),
+            errors.get("type", "unknown"),
+        )
         return order_detail, payment
 
     order_detail = order_response.get("response")
@@ -481,33 +648,81 @@ def webhook(request, *args, **kwargs):
     https://developer.paypal.com/api/rest/webhooks/event-names/
     Webhook reference
     """
-    event_body = request.body.decode("utf-8").strip()
     try:
+        event_body = request.body.decode("utf-8").strip()
         event_json = json.loads(event_body)
-    except json.JSONDecodeError:
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        log_operation(
+            "webhook.inbound",
+            OUTCOME_FAILURE,
+            backend="paypal",
+            payment_provider="paypal",
+            error_code="invalid_payload",
+            status=400,
+        )
         return HttpResponse("Invalid JSON", status=HTTPStatus.BAD_REQUEST)
 
     if not isinstance(event_json, dict) or not isinstance(event_json.get("resource"), dict):
+        log_operation(
+            "webhook.inbound",
+            OUTCOME_FAILURE,
+            backend="paypal",
+            payment_provider="paypal",
+            error_code="invalid_payload",
+            status=400,
+        )
         return HttpResponse("Invalid webhook payload", status=HTTPStatus.BAD_REQUEST)
 
     if event_json.get("resource_type") not in ("checkout-order", "refund", "capture"):
+        log_operation(
+            "webhook.inbound",
+            OUTCOME_FAILURE,
+            backend="paypal",
+            payment_provider="paypal",
+            error_code="wrong_resource_type",
+            status=400,
+        )
         return HttpResponse("Wrong resource type", status=HTTPStatus.BAD_REQUEST)
 
     event, payment_id, rpo = parse_webhook_event(request, event_json)
     if event is None:
+        log_operation(
+            "webhook.inbound",
+            OUTCOME_FAILURE,
+            backend="paypal",
+            payment_provider="paypal",
+            error_code="event_not_found",
+            status=400,
+        )
         return HttpResponse("Unable to get event from webhook", status=HTTPStatus.BAD_REQUEST)
 
     prov = Paypal(event)
 
     # Verify signature
     if not check_webhook_signature(request, event, event_json, prov):
+        log_operation(
+            "webhook.inbound",
+            OUTCOME_FAILURE,
+            backend="paypal",
+            payment_provider="paypal",
+            error_code="signature_invalid",
+            status=400,
+            event_id=event.pk,
+        )
         return HttpResponse("Unable to verify signature of webhook", status=HTTPStatus.BAD_REQUEST)
 
     order_detail, payment = extract_order_and_payment(payment_id, event, event_json, prov, rpo)
     if order_detail is None or payment is None:
+        log_operation(
+            "webhook.inbound",
+            OUTCOME_FAILURE,
+            backend="paypal",
+            payment_provider="paypal",
+            error_code="order_not_found",
+            status=400,
+            event_id=event.pk,
+        )
         return HttpResponse("Order or payment not found", status=HTTPStatus.BAD_REQUEST)
-
-    payment.order.log_action("eventyay.plugins.eventyay_paypal.event", data=event_json)
 
     def handle_refund():
         refund_id_in_event = safe_get(event_json, ["resource", "id"])
@@ -516,7 +731,12 @@ def webhook(request, *args, **kwargs):
             merchant_id=event.settings.payment_paypal_merchant_id,
         )
         if errors := refund_response.get("errors"):
-            logger.error("Paypal error on webhook: %s event=%s", errors.get("reason", errors), event_json)
+            logger.error(
+                "Paypal refund lookup error on webhook for event %s order %s (error_type=%s)",
+                event.pk,
+                payment.order_id,
+                errors.get("type", "unknown"),
+            )
             return HttpResponse(f"Refund {refund_id_in_event} not found", status=HTTPStatus.BAD_REQUEST)
 
         refund_detail = refund_response.get("response")
@@ -603,23 +823,46 @@ def webhook(request, *args, **kwargs):
                     payment.save(update_fields=["info"])
                     payment.confirm()
 
-    if payment.state == OrderPayment.PAYMENT_STATE_CONFIRMED and order_detail["status"] in (
-        "PARTIALLY_REFUNDED",
-        "REFUNDED",
-        "COMPLETED",
-    ):
-        handle_payment_state_confirmed()
-    elif payment.state in (
-        OrderPayment.PAYMENT_STATE_PENDING,
-        OrderPayment.PAYMENT_STATE_CREATED,
-        OrderPayment.PAYMENT_STATE_CANCELED,
-        OrderPayment.PAYMENT_STATE_FAILED,
-    ):
-        handle_payment_state_pending()
-
+    try:
+        payment.order.log_action("eventyay.plugins.eventyay_paypal.event", data=event_json)
+        if payment.state == OrderPayment.PAYMENT_STATE_CONFIRMED and order_detail["status"] in (
+            "PARTIALLY_REFUNDED",
+            "REFUNDED",
+            "COMPLETED",
+        ):
+            handle_payment_state_confirmed()
+        elif payment.state in (
+            OrderPayment.PAYMENT_STATE_PENDING,
+            OrderPayment.PAYMENT_STATE_CREATED,
+            OrderPayment.PAYMENT_STATE_CANCELED,
+            OrderPayment.PAYMENT_STATE_FAILED,
+        ):
+            handle_payment_state_pending()
+    except Exception:
+        log_operation(
+            "webhook.inbound",
+            OUTCOME_FAILURE,
+            backend="paypal",
+            payment_provider="paypal",
+            error_code="processing_error",
+            status=500,
+            event_id=event.pk,
+            order_id=payment.order_id,
+        )
+        raise
+    log_operation(
+        "webhook.inbound",
+        OUTCOME_SUCCESS,
+        backend="paypal",
+        payment_provider="paypal",
+        status=200,
+        event_id=event.pk,
+        order_id=payment.order_id,
+    )
     return HttpResponse(status=HTTPStatus.OK)
 
 
+@_log_permission_denied("oauth.disconnect")
 @event_permission_required("can_change_event_settings")
 def oauth_disconnect(request, **kwargs):
     if request.method != "POST":
@@ -633,6 +876,20 @@ def oauth_disconnect(request, **kwargs):
     del request.event.settings.payment_paypal_connect_user_name
     del request.event.settings.payment_paypal_merchant_id
     request.event.settings.payment_paypal__enabled = False
+    log_operation(
+        "oauth.disconnect",
+        OUTCOME_SUCCESS,
+        backend="paypal",
+        payment_provider="paypal",
+        event_id=request.event.pk,
+    )
+    log_operation(
+        "plugin.disabled",
+        OUTCOME_SUCCESS,
+        backend="paypal",
+        payment_provider="paypal",
+        event_id=request.event.pk,
+    )
     messages.success(request, _("Your PayPal account has been disconnected."))
 
     return redirect_to_paypal_settings(request.event)
